@@ -217,9 +217,7 @@ export function registerHandlers(mainWindowGetter: () => Electron.BrowserWindow)
             store.add(created);
             emitGeneratedChanged(win, { reason: "CREATED" });
 
-            const preview = parseSrt(
-                fs.readFileSync(res.srtPath, "utf-8")
-            );
+            const preview = parseSrt(fs.readFileSync(res.srtPath, "utf-8"));
 
             emitJobDone(win, {
                 jobId,

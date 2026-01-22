@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import type { GeneratedFileDTO, GranularityPreset, LanguageCode, ModelId, SubtitleFormat } from "../shared/ipc/dtos";
+import type { SegmentPreviewDTO } from "../shared/ipc/dtos";
 
 import "./App.css";
 
@@ -55,13 +56,62 @@ export default function App() {
     const [step, setStep] = useState<StepKey>("IDLE");
     const [message, setMessage] = useState<string>("");
 
-    const [preview, setPreview] = useState<{ index: number; text: string }[]>([]);
+    const [preview, setPreview] = useState<SegmentPreviewDTO[]>([]);
     const [generated, setGenerated] = useState<GeneratedFileDTO[]>([]);
     const [selectedId, setSelectedId] = useState<string>("");
 
     const [menuOpenForId, setMenuOpenForId] = useState<string>("");
 
     const [granularity, setGranularity] = useState<GranularityPreset>("MEDIUM");
+
+    const [hoveredCueIndex, setHoveredCueIndex] = useState<number | null>(null);
+
+    const [previewMeta, setPreviewMeta] = useState<{ granularity: GranularityPreset } | null>(null);
+
+
+    async function copyToClipboard(text: string) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch {
+            // fallback simples
+            try {
+                const ta = document.createElement("textarea");
+                ta.value = text;
+                ta.style.position = "fixed";
+                ta.style.left = "-9999px";
+                ta.style.top = "-9999px";
+                document.body.appendChild(ta);
+                ta.focus();
+                ta.select();
+                const ok = document.execCommand("copy");
+                document.body.removeChild(ta);
+                return ok;
+            } catch {
+                return false;
+            }
+        }
+    }
+
+    function buildPreviewBlockText(cues: typeof preview) {
+        // Formato simples e útil para colar em editor/chat:
+        // mm:ss --> mm:ss
+        // texto
+        return cues
+            .map((c) => `${formatMs(c.startMs)} --> ${formatMs(c.endMs)}\n${c.text}`)
+            .join("\n\n");
+    }
+
+    function CopyIcon({ size = 16 }: { size?: number }) {
+        return (
+            <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                    d="M16 1H6a2 2 0 0 0-2 2v12h2V3h10V1zm3 4H10a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H10V7h9v14z"
+                    fill="currentColor"
+                />
+            </svg>
+        );
+    }
 
     const MENU_W = 200;
     const MENU_PAD = 10;
@@ -120,13 +170,14 @@ export default function App() {
         const off1 = window.api.onJobProgress((e) => {
             setStep((e.step as StepKey) ?? "IDLE");
             setMessage(e.message || "");
+            setPreviewMeta({ granularity });
         });
 
         const off2 = window.api.onJobDone((e) => {
             setBusy(false);
             setStep("DONE");
             setMessage("Concluído.");
-            setPreview(e.preview.map((p) => ({ index: p.index, text: p.text })));
+            setPreview(e.preview);
             refreshGenerated(e.generated.id);
         });
 
@@ -310,6 +361,83 @@ export default function App() {
         return idx;
     }, [step]);
 
+    function formatMs(ms: number) {
+        const s = Math.floor(ms / 1000);
+        const m = Math.floor(s / 60);
+        const r = s % 60;
+        return `${m}:${String(r).padStart(2, "0")}`;
+    }
+
+    const GRANULARITY_INFO: Record<GranularityPreset, { title: string; desc: string }> = {
+        LOW: { title: "Baixa (mais denso)", desc: "Menos quebras. Blocos maiores, leitura mais contínua." },
+        MEDIUM: { title: "Média (equilibrado)", desc: "Equilíbrio entre legibilidade e ritmo. Bom padrão geral." },
+        HIGH: { title: "Alta (mais fragmentado)", desc: "Mais quebras. Melhor para fala rápida e cortes." },
+        ULTRA: { title: "Altíssima (bem picado)", desc: "Muito fragmentado. Ideal para estilo Shorts/TikTok." },
+    };
+
+    function countWords(t: string) {
+        const s = t.trim();
+        if (!s) return 0;
+        return s.split(/\s+/).filter(Boolean).length;
+    }
+
+    const previewStats = useMemo(() => {
+        if (!preview.length) return null;
+
+        const maxEndMs = Math.max(...preview.map((c) => c.endMs));
+        const durationSec = Math.max(0.1, maxEndMs / 1000);
+
+        const charsPerCue = preview.map((c) => c.text.replace(/\s+/g, " ").trim().length);
+        const wordsPerCue = preview.map((c) => countWords(c.text));
+
+        const totalChars = charsPerCue.reduce((a, b) => a + b, 0);
+        const totalWords = wordsPerCue.reduce((a, b) => a + b, 0);
+
+        const avgCharsPerCue = totalChars / preview.length;
+        const avgWordsPerCue = totalWords / preview.length;
+
+        const maxCharsPerCue = Math.max(...charsPerCue);
+        const maxWordsPerCue = Math.max(...wordsPerCue);
+
+        const cps = totalChars / durationSec;
+
+        const veryShortCount = charsPerCue.filter((n) => n > 0 && n < 8).length;
+        const veryShortRate = veryShortCount / preview.length;
+
+        return {
+            cues: preview.length,
+            durationSec,
+            totalChars,
+            totalWords,
+            cps,
+            avgCharsPerCue,
+            avgWordsPerCue,
+            maxCharsPerCue,
+            maxWordsPerCue,
+            veryShortRate,
+        };
+    }, [preview]);
+
+    const densityAlerts = useMemo(() => {
+        if (!previewStats) return [];
+        const a: { level: "warn" | "danger"; text: string }[] = [];
+
+        if (previewStats.cps > 22) a.push({ level: "danger", text: `CPS muito alto (${previewStats.cps.toFixed(1)}). Legendas podem ficar rápidas demais.` });
+        else if (previewStats.cps > 18) a.push({ level: "warn", text: `CPS alto (${previewStats.cps.toFixed(1)}). Considere granularidade maior ou revisão manual.` });
+
+        if (previewStats.maxCharsPerCue > 100) a.push({ level: "warn", text: `Há blocos muito longos (máx. ${previewStats.maxCharsPerCue} chars).` });
+
+        if (previewStats.veryShortRate > 0.35) a.push({ level: "warn", text: `Muitos blocos muito curtos (${Math.round(previewStats.veryShortRate * 100)}%). Pode ficar “picado”.` });
+
+        return a;
+    }, [previewStats]);
+
+    const isPreviewStale = useMemo(() => {
+        if (!preview.length) return false;
+        if (!previewMeta) return false;
+        return previewMeta.granularity !== granularity;
+    }, [preview.length, previewMeta, granularity]);
+
     return (
         <div style={styles.page}>
             <h1 style={{ margin: "4px 0 14px" }}>Legenda (MVP)</h1>
@@ -379,12 +507,23 @@ export default function App() {
                                         value={granularity}
                                         onChange={(e) => setGranularity(e.target.value as GranularityPreset)}
                                         className="w-full rounded-lg border px-3 py-2"
+                                        disabled={busy}
                                     >
                                         <option value="LOW">Baixa (mais denso)</option>
                                         <option value="MEDIUM">Média (recomendado)</option>
                                         <option value="HIGH">Alta</option>
                                         <option value="ULTRA">Altíssima (mais picado)</option>
                                     </select>
+
+                                    <div style={{ marginTop: 8, fontSize: 12, color: "#666", lineHeight: 1.35 }}>
+                                        <b>{GRANULARITY_INFO[granularity].title}:</b> {GRANULARITY_INFO[granularity].desc}
+                                    </div>
+
+                                    {/* {preview.length > 0 && isPreviewStale && (
+                                        <div style={{ marginTop: 8, fontSize: 12, color: "#8a1f1f" }}>
+                                            A prévia atual foi gerada com <b>{previewMeta?.granularity}</b>. Gere novamente para refletir <b>{granularity}</b>.
+                                        </div>
+                                    )} */}
                                 </div>
                             )}
 
@@ -477,13 +616,100 @@ export default function App() {
                         {preview.length === 0 ? (
                             <div style={{ color: "#777", fontSize: 13 }}>A prévia aparece ao concluir.</div>
                         ) : (
-                            <ol style={{ margin: "8px 0 0 18px" }}>
-                                {preview.map((p) => (
-                                    <li key={p.index} style={{ marginBottom: 6 }}>
-                                        {p.text}
-                                    </li>
-                                ))}
-                            </ol>
+                            <div style={styles.previewWrap}>
+                                {/* Copiar bloco (sempre visível) */}
+                                <button
+                                    type="button"
+                                    title="Copiar bloco"
+                                    style={styles.copyBlockBtn}
+                                    onClick={async () => {
+                                        const text = buildPreviewBlockText(preview);
+                                        const ok = await copyToClipboard(text);
+                                        if (!ok) alert("Não foi possível copiar para a área de transferência.");
+                                    }}
+                                >
+                                    <CopyIcon />
+                                </button>
+
+                                {previewStats && (
+                                    <div style={{ marginBottom: 10, fontSize: 12, color: "#555", lineHeight: 1.35 }}>
+                                        <div>
+                                            <b>Métricas:</b> {previewStats.cues} blocos • {Math.round(previewStats.durationSec)}s • CPS {previewStats.cps.toFixed(1)} •
+                                            Média {previewStats.avgCharsPerCue.toFixed(0)} chars/bloco
+                                        </div>
+
+                                        {densityAlerts.length > 0 && (
+                                            <div style={{ marginTop: 6 }}>
+                                                {densityAlerts.map((x, i) => (
+                                                    <div key={i} style={{ color: x.level === "danger" ? "#8a1f1f" : "#7a5a00" }}>
+                                                        • {x.text}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {/* Lista */}
+                                <div style={styles.previewList}>
+                                    {preview.map((p) => {
+                                        const hovered = hoveredCueIndex === p.index;
+
+                                        return (
+                                            <div
+                                                key={p.index}
+                                                style={styles.previewRow}
+                                                onMouseEnter={() => setHoveredCueIndex(p.index)}
+                                                onMouseLeave={() => setHoveredCueIndex(null)}
+                                            >
+                                                <div style={styles.previewRowHeader}>
+                                                    <span style={styles.previewTime}>
+                                                        {formatMs(p.startMs)} → {formatMs(p.endMs)}
+                                                    </span>
+
+                                                    {/* Copiar linha (só no hover) */}
+                                                    <button
+                                                        type="button"
+                                                        title="Copiar texto"
+                                                        onClick={async () => {
+                                                            const ok = await copyToClipboard(p.text);
+                                                            if (!ok) alert("Não foi possível copiar para a área de transferência.");
+                                                        }}
+                                                        style={{
+                                                            ...styles.copyLineBtn,
+                                                            opacity: hovered ? 1 : 0,
+                                                            pointerEvents: hovered ? "auto" : "none",
+                                                        }}
+                                                    >
+                                                        <CopyIcon size={15} />
+                                                    </button>
+                                                </div>
+
+                                                <div style={styles.previewText}>
+                                                    {/* preserva quebras */}
+                                                    {p.text.split("\n").map((line, i) => (
+                                                        <React.Fragment key={i}>
+                                                            {line}
+                                                            {i < p.text.split("\n").length - 1 ? <br /> : null}
+                                                        </React.Fragment>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+
+                            // <div style={{ margin: "8px 0 0 18px", maxHeight: "250px", overflowY: "scroll" }}>
+                            //     {preview.map((p) => (
+                            //         <div key={p.index}>
+                            //             <span style={{ fontWeight: '600', fontStyle: 'italic', fontSize: 'small' }}>
+                            //                 {formatMs(p.startMs)} → {formatMs(p.endMs)}
+                            //             </span>
+                            //             <p style={{ marginTop: "0px" }}>{p.text}</p>
+                            //         </div>
+                            //     ))}
+                            // </div>
                         )}
                     </section>
                 </div>
@@ -894,7 +1120,7 @@ const styles: Record<string, React.CSSProperties> = {
     flowRow: {
         display: "flex",
         alignItems: "center",
-        gap: 10,
+        gap: 5,
         flexWrap: "nowrap",
         overflowX: "auto",
         overflowY: "hidden",
@@ -902,7 +1128,7 @@ const styles: Record<string, React.CSSProperties> = {
         WebkitOverflowScrolling: "touch"
     },
     flowNode: {
-        padding: "8px 12px",
+        padding: "8px",
         borderRadius: 999,
         border: "1px solid #e6e6e6",
         fontSize: 12,
@@ -919,4 +1145,77 @@ const styles: Record<string, React.CSSProperties> = {
         flex: "0 0 auto"
     },
     flowHint: { marginTop: 8, fontSize: 12, color: "#777" },
+    previewWrap: {
+        position: "relative",
+        border: "1px solid #eee",
+        borderRadius: 12,
+        padding: "4px 12px 12px 12px",
+        background: "#fff",
+        maxHeight: 290,
+        overflow: "auto",
+    },
+
+    copyBlockBtn: {
+        position: "sticky", // fica “no topo” durante scroll do preview
+        top: 0,
+        float: "right", // garante canto superior direito dentro do wrap
+        zIndex: 5,
+        width: 28,
+        height: 28,
+        borderRadius: 10,
+        border: "1px solid #e6e6e655",
+        background: "#fff",
+        cursor: "pointer",
+        display: "grid",
+        placeItems: "center",
+        color: "#444",
+    },
+
+    previewList: {
+        marginTop: 34,
+    },
+
+    previewRow: {
+        position: "relative",
+        padding: "10px 10px",
+        borderRadius: 10,
+        border: "1px solid #f0f0f0EE",
+        marginBottom: 10,
+        background: "#fff",
+    },
+
+    previewRowHeader: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 10,
+    },
+
+    previewTime: {
+        fontSize: 12,
+        color: "#666",
+        fontStyle: "italic",
+        fontWeight: 800,
+    },
+
+    copyLineBtn: {
+        width: 30,
+        height: 30,
+        borderRadius: 10,
+        border: "1px solid #e6e6e655",
+        background: "#fff",
+        cursor: "pointer",
+        display: "grid",
+        placeItems: "center",
+        color: "#444",
+        transition: "opacity 120ms ease",
+    },
+
+    previewText: {
+        marginTop: 0,
+        fontSize: 13,
+        color: "#222",
+        lineHeight: 1,
+        whiteSpace: "normal",
+    },
 };
